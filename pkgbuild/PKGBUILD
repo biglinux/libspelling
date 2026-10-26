@@ -1,0 +1,83 @@
+# Original package from ArchLinux
+# Maintainer: Fabian Bornschein <fabiscafe@archlinux.org>
+# Maintainer: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
+
+# This version frees a spelling dictionary when no checker uses it
+# Maintainer: Bruno Goncalves <biglinux.com.br>
+
+pkgbase=libspelling
+pkgname=(
+  libspelling
+  libspelling-docs
+)
+pkgver=0.4.10
+pkgrel=1.1
+pkgdesc="Spellcheck library for GTK 4"
+url="https://gitlab.gnome.org/GNOME/libspelling"
+arch=(x86_64)
+license=(LGPL-2.1-or-later)
+depends=(
+  enchant
+  glib2
+  glibc
+  gtk4
+  gtksourceview5
+  icu
+  libgcc
+  pango
+)
+makedepends=(
+  gi-docgen
+  git
+  gobject-introspection
+  meson
+  vala
+)
+checkdepends=(
+  aspell
+  aspell-en
+  enchant
+  hspell
+  hunspell
+  nuspell
+  libvoikko
+)
+source=(
+  # libspelling tags use SSH signatures that makepkg doesn't understand
+  "git+https://gitlab.gnome.org/GNOME/libspelling.git#tag=$pkgver"
+  free-unused-dictionaries.patch
+)
+b2sums=('fd96e152bf7c5732fc6c8c84c0375edfdb6a05618856ab5ca467609e1849ac5fc2fa784c950883143a7a08aef2daedcc1f98997390324bf55e751981f53f7dc2'
+        'c99b8bf4a0fbe5a0477e7f0f9e4e8d397bba29f168161a532ef4ffcd28e2aa338a247fefad4369df33d7b6dca1fed21513ac22fe37ce766f072a8aafdff4e375')
+
+prepare() {
+  cd $pkgname
+  patch -Np1 -i ../free-unused-dictionaries.patch
+}
+
+build() {
+  arch-meson $pkgname build
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --print-errorlogs
+}
+
+package_libspelling() {
+  provides=(libspelling-1.so)
+
+  meson install -C build --destdir "$pkgdir"
+
+  mkdir -p doc/usr/share
+  mv {"$pkgdir",doc}/usr/share/doc
+}
+
+package_libspelling-docs() {
+  pkgdesc+=" (documentation)"
+  depends=()
+
+  mv doc/* "$pkgdir"
+}
+
+# vim:set sw=2 sts=-1 et:
