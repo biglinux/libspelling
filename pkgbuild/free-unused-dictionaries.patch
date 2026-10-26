@@ -1,0 +1,153 @@
+From f0bcd255f378a776b87f85a34c1af6e3b2e00e91 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Bruno=20Gon=C3=A7alves?= <bigbruno@gmail.com>
+Date: Mon, 26 Oct 2026 15:45:33 -0300
+Subject: [PATCH] enchant: free a dictionary when its last user goes away
+
+The provider kept every EnchantDict it loaded until the process exited,
+so a program that once showed a spell-checked view kept the hunspell
+tables after closing it: 26 to 30 MiB with the pt_BR dictionary.
+
+Track dictionaries with weak references, so they are shared while in
+use, and give the native dictionary back to the broker on finalize. A
+SpellingJob may drop the last reference from its worker thread, so the
+broker is only called from the default main context.
+---
+ lib/enchant/spelling-enchant-dictionary.c | 15 ++++++++++--
+ lib/enchant/spelling-enchant-provider.c   | 28 +++++++++++++++--------
+ lib/enchant/spelling-enchant-provider.h   |  3 +++
+ 3 files changed, 35 insertions(+), 11 deletions(-)
+
+diff --git a/lib/enchant/spelling-enchant-dictionary.c b/lib/enchant/spelling-enchant-dictionary.c
+index e77ce13..c171935 100644
+--- a/lib/enchant/spelling-enchant-dictionary.c
++++ b/lib/enchant/spelling-enchant-dictionary.c
+@@ -24,6 +24,7 @@
+ #include <enchant.h>
+ 
+ #include "spelling-enchant-dictionary.h"
++#include "spelling-enchant-provider.h"
+ 
+ #define MAX_RESULTS 10
+ 
+@@ -256,13 +257,23 @@ spelling_enchant_dictionary_constructed (GObject *object)
+     }
+ }
+ 
++static gboolean
++free_native (gpointer native)
++{
++  enchant_broker_free_dict (spelling_enchant_provider_get_broker (), native);
++  return G_SOURCE_REMOVE;
++}
++
+ static void
+ spelling_enchant_dictionary_finalize (GObject *object)
+ {
+   SpellingEnchantDictionary *self = (SpellingEnchantDictionary *)object;
+ 
+-  /* Owned by provider */
+-  self->native = NULL;
++  /* The broker is not thread-safe and the last reference may be dropped by a
++   * spelling job on a worker thread, so the broker is only used from the
++   * default main context. */
++  if (self->native != NULL)
++    g_main_context_invoke (NULL, free_native, g_steal_pointer (&self->native));
+ 
+   /* Global, no need to free */
+   self->language = NULL;
+diff --git a/lib/enchant/spelling-enchant-provider.c b/lib/enchant/spelling-enchant-provider.c
+index b677ecc..13becd9 100644
+--- a/lib/enchant/spelling-enchant-provider.c
++++ b/lib/enchant/spelling-enchant-provider.c
+@@ -38,10 +38,12 @@ struct _SpellingEnchantProvider
+ 
+ G_DEFINE_FINAL_TYPE (SpellingEnchantProvider, spelling_enchant_provider, SPELLING_TYPE_PROVIDER)
+ 
++/* language (interned) -> GWeakRef to its SpellingEnchantDictionary, so the
++ * dictionary is shared while it is in use and freed with its last user. */
+ static GHashTable *dictionaries;
+ 
+-static EnchantBroker *
+-get_broker (void)
++EnchantBroker *
++spelling_enchant_provider_get_broker (void)
+ {
+   static EnchantBroker *broker;
+ 
+@@ -132,7 +134,7 @@ spelling_enchant_provider_supports_language (SpellingProvider *provider,
+   g_assert (SPELLING_IS_ENCHANT_PROVIDER (provider));
+   g_assert (language != NULL);
+ 
+-  return enchant_broker_dict_exists (get_broker (), language);
++  return enchant_broker_dict_exists (spelling_enchant_provider_get_broker (), language);
+ }
+ 
+ static void
+@@ -160,7 +162,7 @@ list_languages_cb (const char * const lang_tag,
+ static GListModel *
+ spelling_enchant_provider_list_languages (SpellingProvider *provider)
+ {
+-  EnchantBroker *broker = get_broker ();
++  EnchantBroker *broker = spelling_enchant_provider_get_broker ();
+   GListStore *store = g_list_store_new (SPELLING_TYPE_LANGUAGE);
+   enchant_broker_list_dicts (broker, list_languages_cb, store);
+   return G_LIST_MODEL (store);
+@@ -171,25 +173,33 @@ spelling_enchant_provider_load_dictionary (SpellingProvider *provider,
+                                            const char       *language)
+ {
+   SpellingDictionary *ret;
++  GWeakRef *weak;
+ 
+   g_assert (SPELLING_IS_ENCHANT_PROVIDER (provider));
+   g_assert (language != NULL);
+ 
+   if (dictionaries == NULL)
+-    dictionaries = g_hash_table_new_full (g_str_hash, g_str_equal, NULL, g_object_unref);
++    dictionaries = g_hash_table_new (g_str_hash, g_str_equal);
+ 
+-  if (!(ret = g_hash_table_lookup (dictionaries, language)))
++  if (!(weak = g_hash_table_lookup (dictionaries, language)))
+     {
+-      EnchantDict *dict = enchant_broker_request_dict (get_broker (), language);
++      weak = g_new0 (GWeakRef, 1);
++      g_weak_ref_init (weak, NULL);
++      g_hash_table_insert (dictionaries, (char *)g_intern_string (language), weak);
++    }
++
++  if (!(ret = g_weak_ref_get (weak)))
++    {
++      EnchantDict *dict = enchant_broker_request_dict (spelling_enchant_provider_get_broker (), language);
+ 
+       if (dict == NULL)
+         return NULL;
+ 
+       ret = spelling_enchant_dictionary_new (language, dict);
+-      g_hash_table_insert (dictionaries, (char *)g_intern_string (language), ret);
++      g_weak_ref_set (weak, ret);
+     }
+ 
+-  return ret ? g_object_ref (ret) : NULL;
++  return ret;
+ }
+ 
+ static void
+diff --git a/lib/enchant/spelling-enchant-provider.h b/lib/enchant/spelling-enchant-provider.h
+index 3df9a43..8ad8f09 100644
+--- a/lib/enchant/spelling-enchant-provider.h
++++ b/lib/enchant/spelling-enchant-provider.h
+@@ -20,6 +20,8 @@
+ 
+ #pragma once
+ 
++#include <enchant.h>
++
+ #include "spelling-provider-internal.h"
+ 
+ G_BEGIN_DECLS
+@@ -29,5 +31,6 @@ G_BEGIN_DECLS
+ G_DECLARE_FINAL_TYPE (SpellingEnchantProvider, spelling_enchant_provider, SPELLING, ENCHANT_PROVIDER, SpellingProvider)
+ 
+ SpellingProvider *spelling_enchant_provider_new (void);
++EnchantBroker    *spelling_enchant_provider_get_broker (void);
+ 
+ G_END_DECLS
